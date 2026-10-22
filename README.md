@@ -44,11 +44,7 @@ __global__ void device_reduce_v0(float* d_x, float* d_y) {
 }
 ```
 
-一个 block 负责 `blockDim.x` 个元素。`offset` 从一半开始，每轮减半：前半段线程把后半段加到自己身上。`tid == 0` 时，`x[0]` 就是这个 block 的部分和。
 
-`GRID_SIZE = CEIL(N, BLOCK_SIZE)`。kernel 结束后把 `d_y` 拷回主机，再把 `GRID_SIZE` 个部分和加起来。
-
-这一版直接改输入数组，没有越界判断，所以 `N` 必须是 `BLOCK_SIZE` 的整数倍。`main` 里同一个 `d_nums` 会被重复归约，第二次读到的已经是被改过的数据，打印出的 sum 会和主机结果差很远。
 
 ## v1：静态共享内存
 
@@ -72,9 +68,7 @@ __global__ void device_reduce_v1(float* d_x, float* d_y, const int N) {
 }
 ```
 
-静态 `__shared__` 数组的长度必须是编译期常量，所以 block 大小用模板参数 `BLOCK_SIZE` 传进来。
 
-v0 每一轮折半都在全局内存上读写，一共大约 `log2(BLOCK_SIZE)` 轮。v1 只在开头把数据搬进共享内存，后面的折半都发生在共享内存里。全局内存延迟是几百个时钟周期，共享内存是几十个，所以这一步是 v0 到 v1 的主要加速来源。越界线程填 `0.0`，`N` 不再必须整除 `BLOCK_SIZE`，输入数组也不会被改掉。
 
 ## v2：动态共享内存
 
@@ -86,7 +80,6 @@ extern __shared__ float s_y[];
 device_reduce_v2<<<grid_size, block_size, sizeof(float) * BLOCK_SIZE>>>(d_x, d_y, N);
 ```
 
-第三个启动参数是动态共享内存的字节数。kernel 不必再做成模板，换 block 大小不用重新实例化。归约仍然在共享内存里完成，耗时和 v1 处于同一档。
 
 ## v3：atomicAdd 去掉 CPU 收尾
 
@@ -98,7 +91,7 @@ if (tid == 0) {
 }
 ```
 
-多个 block 的 0 号线程会同时更新同一个地址。`atomicAdd` 把「读出、相加、写回」做成一次原子操作。如果写成 `*d_y += s_y[0]`，两个 block 可能读到同一个旧值，后写的覆盖先写的，结果会丢。
+多个 block 的 0 号线程会同时更新同一个地址。`atomicAdd` 把「读出、相加、写回」做成一次原子操作。
 
 调用前要把这一个 `float` 清零。主机改不了设备内存，所以先在主机写成 `0`，再 `cudaMemcpy` 到 `d_y`：
 
@@ -138,13 +131,7 @@ if (warpId == 0) {
 }
 ```
 
-同一个 warp 里的线程由硬件锁在一起，shuffle 直接在寄存器之间传值，这一级不写共享内存，也不调用 `__syncthreads()`。`__shfl_down_sync(0xFFFFFFFF, val, offset)` 让当前 lane 拿到「自己往下数 `offset` 个 lane」的 `val`。`offset` 从 16 减到 1，一个 warp 就被加成一个数，留在 lane 0。
 
-lane 0 把这个数写入 `s_y[warpId]`。`__syncthreads()` 要等所有 warp 都写完，后面才能读 `s_y`。
-
-然后只用 block 里的 0 号 warp：前 `warpNum` 个 lane 各拿一个 warp 的部分和，其余 lane 补 0，再 shuffle 一次。lane 0 执行 `atomicAdd`。
-
-下面把 warp 画成 8 个线程，只说明数据被压了几级。实际 `warpSize` 是 32。
 
 ```text
 原始数据：  每 warp 8 个数 × 若干 warp × 若干 block
@@ -167,7 +154,7 @@ lane 0 把这个数写入 `s_y[warpId]`。`__syncthreads()` 要等所有 warp �
 最终结果：   d_y = 336
 ```
 
-和 v3 比，差在 block 内部。v3 让全部线程在共享内存里一起折半，每轮都要 `__syncthreads()`。v4 先在每个 warp 的寄存器里折半，整个 block 只同步一次，共享内存从「每个线程一个槽」收成「每个 warp 一个槽」。
+
 
 以 16 个数、1 个 block、2 个长度为 8 的 warp 为例：
 
@@ -180,7 +167,6 @@ lane 0 把这个数写入 `s_y[warpId]`。`__syncthreads()` 要等所有 warp �
 
 ## v5：float4
 
-每个线程连续读 4 个 `float`，全局下标要乘 4，grid 也要按「每线程 4 个元素」缩小：
 
 ```cpp
 // 每个 block 覆盖 BLOCK_SIZE * 4 个元素
@@ -197,7 +183,7 @@ if (idx < N) {
 }
 ```
 
-读完之后的 shuffle、`s_y[32]`、`atomicAdd` 与 v4 相同。
+
 
 ```text
 原始数据：  每线程 4 个数 × 若干线程 × 若干 warp × 若干 block
